@@ -4,9 +4,19 @@ __pycache__/
 # Verificador/generador oficial del challenge (no es codigo propio, no se redistribuye)
 smio_clrp_verify_src/
 
-# Salidas generadas por el solver (regenerables, no son fuente)
-out/
+# Instancias oficiales (pesadas, no se redistribuyen)
+Instancias_oficiales/
+
+# Entornos virtuales locales -- no se distribuyen
+.venv/
+.venv312/
+
+# Salidas generadas por el solver (regenerables, no son fuente) -- excepto la
+# carpeta de envio final, que si se sube como parte de los resultados.
+out/*
+!out/final_submission/
 *.sol.txt
+!out/final_submission/*.sol.txt
 
 # Config local de herramientas
 .claude/

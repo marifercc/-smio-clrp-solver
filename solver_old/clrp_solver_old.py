@@ -42,36 +42,14 @@ from smio_clrp_verify.verify import parse_instance, verify_solution  # noqa: E40
 # Distance helper (mirrors smio_clrp_verify.verify._edge_cost exactly)
 # ---------------------------------------------------------------------------
 
-def _build_distance_cache(inst) -> list[list[float]]:
-    """Precompute every pairwise distance once as a nested list of plain
-    Python floats. edge_cost() gets called tens of millions of times during
-    local search (one full sqrt + attribute-lookup chain per call on the
-    COORDS path), so on large instances that recomputation dominates the
-    whole run; a single vectorised numpy pass up front plus flat list
-    indexing afterwards is dramatically cheaper per call.
-    """
-    if inst.distance_format == "FULL_MATRIX":
-        mat = np.asarray(inst.distance_matrix, dtype=np.float64)
-    else:
-        coords = np.asarray(inst.coords, dtype=np.float64)
-        diff = coords[:, None, :] - coords[None, :, :]
-        mat = np.round(np.sqrt((diff * diff).sum(axis=2)), 1)
-    return mat.tolist()
-
-
-def ensure_distance_cache(inst) -> None:
-    """Attach the precomputed pairwise-distance cache to inst if it isn't
-    there yet (idempotent). Must run before the first edge_cost() call --
-    edge_cost trusts the cache exists and does zero per-call setup work,
-    since it gets called tens of millions of times during local search.
-    """
-    if not hasattr(inst, "_dist_cache"):
-        object.__setattr__(inst, "_dist_cache", _build_distance_cache(inst))
-
-
 def edge_cost(inst, a: int, b: int) -> float:
     """0-based node indices a, b (0..m-1 depots, m..m+n-1 customers)."""
-    return inst._dist_cache[a][b]
+    if inst.distance_format == "FULL_MATRIX":
+        return float(inst.distance_matrix[a, b])
+    ax, ay = inst.coords[a]
+    bx, by = inst.coords[b]
+    dx, dy = ax - bx, ay - by
+    return round(math.sqrt(dx * dx + dy * dy), 1)
 
 
 # ---------------------------------------------------------------------------
@@ -353,21 +331,14 @@ def build_neighbor_lists(inst, k: int = 15) -> list[list[int]]:
 
 
 def local_search(inst, routes_by_depot, neighbor_lists, time_limit: float = 30.0):
-    """Improve a constructed solution with relocate + swap + or-opt + depot-close moves.
+    """Improve a constructed solution with relocate + swap + depot-close moves.
 
     Relocate: remove a customer and re-insert it (at its cheapest position)
     into a different route, if that reduces total cost.
     Swap: exchange two customers between two routes (position-preserving),
     if that reduces total cost.
-    Or-opt: move a block of 2-3 CONSECUTIVE customers (starting at the
-    customer being considered, in its current route) to another route, in
-    either orientation. This catches improvements that single-customer
-    relocate structurally cannot: sometimes moving just one of two adjacent
-    customers makes things worse (you pay to reconnect the other one's
-    neighbours), but moving both together as a block is a net win because
-    the edge between them travels with them instead of being re-paid.
-    All three moves only consider target routes/customers drawn from each
-    customer's nearest-neighbour list, and all respect vehicle capacity Q
+    Both moves only consider target routes/customers drawn from each
+    customer's nearest-neighbour list, and both respect vehicle capacity Q
     and depot capacity W_i (the number of routes/vehicles never changes, so
     V_i is automatically respected).
 
@@ -666,12 +637,6 @@ def local_search(inst, routes_by_depot, neighbor_lists, time_limit: float = 30.0
             # SWAP: intercambiar a c con un vecino cercano c2 (pueden estar en
             # la misma ruta o en dos distintas), si el intercambio achica la
             # distancia total de ambas rutas involucradas.
-            # pos_c/nodes_old dependen solo de r_old y c, que no cambian en
-            # este loop (ningun movimiento se aplica hasta elegir el mejor),
-            # asi que se calculan una sola vez en vez de una vez por c2.
-            pos_c = routes[r_old]["custs"].index(c)
-            nodes_old = route_nodes(r_old)
-            a1, b1 = nodes_old[pos_c], nodes_old[pos_c + 2]
             for c2 in neighbor_lists[c]:
                 r2 = route_of.get(c2)
                 if r2 is None or r2 == r_old:
@@ -684,8 +649,11 @@ def local_search(inst, routes_by_depot, neighbor_lists, time_limit: float = 30.0
                     if (depot_load.get(d_old, 0) - dem + dem2 > depot_capacities[d_old]
                             or depot_load.get(d2, 0) - dem2 + dem > depot_capacities[d2]):
                         continue
+                pos_c = routes[r_old]["custs"].index(c)
                 pos_c2 = routes[r2]["custs"].index(c2)
-                nodes_2 = route_nodes(r2)
+                nodes_old = route_nodes(r_old)
+                nodes_2 = route_nodes(r2) if r2 != r_old else nodes_old
+                a1, b1 = nodes_old[pos_c], nodes_old[pos_c + 2]
                 a2, b2 = nodes_2[pos_c2], nodes_2[pos_c2 + 2]
                 before = (edge_cost(inst, a1, m + c) + edge_cost(inst, m + c, b1)
                           + edge_cost(inst, a2, m + c2) + edge_cost(inst, m + c2, b2))
@@ -695,46 +663,6 @@ def local_search(inst, routes_by_depot, neighbor_lists, time_limit: float = 30.0
                 if gain > best_gain:
                     best_gain = gain
                     best_move = ("swap", r2, c2)
-
-            # OR-OPT: mover un segmento de 2 o 3 clientes CONSECUTIVOS
-            # (empezando en c, en su ruta actual) a otra ruta, probando las
-            # dos orientaciones (orden original e invertido). Relocate solo
-            # mueve un cliente a la vez -- hay mejoras que solo aparecen
-            # moviendo un par/trio pegado como bloque (mover nada mas uno de
-            # los dos empeora, pero moverlos juntos mejora, porque el enlace
-            # interno entre ellos se conserva y no se paga de nuevo).
-            custs_old = routes[r_old]["custs"]
-            for seg_len in (2, 3):
-                if pos_c + seg_len > len(custs_old):
-                    break
-                segment = custs_old[pos_c:pos_c + seg_len]
-                seg_dem = sum(inst.demands[cc] for cc in segment)
-                pred, succ = nodes_old[pos_c], nodes_old[pos_c + seg_len + 1]
-                seg_first, seg_last = m + segment[0], m + segment[-1]
-                seg_saving = (edge_cost(inst, pred, seg_first)
-                              + edge_cost(inst, seg_last, succ)
-                              - edge_cost(inst, pred, succ))
-
-                for r_new in cand_routes:
-                    d_new = routes[r_new]["depot"]
-                    if route_load[r_new] + seg_dem > Q:
-                        continue
-                    if d_new != d_old and depot_load.get(d_new, 0) + seg_dem > depot_capacities[d_new]:
-                        continue
-                    nodes_new = route_nodes(r_new)
-                    for i in range(len(nodes_new) - 1):
-                        a, b = nodes_new[i], nodes_new[i + 1]
-                        ab = edge_cost(inst, a, b)
-                        delta_fwd = edge_cost(inst, a, seg_first) + edge_cost(inst, seg_last, b) - ab
-                        gain_fwd = seg_saving - delta_fwd
-                        if gain_fwd > best_gain:
-                            best_gain = gain_fwd
-                            best_move = ("oropt", r_new, i, seg_len, False)
-                        delta_rev = edge_cost(inst, a, seg_last) + edge_cost(inst, seg_first, b) - ab
-                        gain_rev = seg_saving - delta_rev
-                        if gain_rev > best_gain:
-                            best_gain = gain_rev
-                            best_move = ("oropt", r_new, i, seg_len, True)
 
             if best_move is None:
                 continue  # ninguna jugada mejoro el costo para este cliente
@@ -753,7 +681,7 @@ def local_search(inst, routes_by_depot, neighbor_lists, time_limit: float = 30.0
                 route_load[r_new] += dem
                 depot_load[d_new] = depot_load.get(d_new, 0) + dem
                 route_of[c] = r_new
-            elif best_move[0] == "swap":
+            else:
                 _, r2, c2 = best_move
                 d2 = routes[r2]["depot"]
                 dem2 = inst.demands[c2]
@@ -767,23 +695,6 @@ def local_search(inst, routes_by_depot, neighbor_lists, time_limit: float = 30.0
                 depot_load[d2] = depot_load.get(d2, 0) + dem - dem2
                 route_of[c] = r2
                 route_of[c2] = r_old
-            else:  # "oropt": mover el segmento de seg_len clientes que
-                # empieza en c (posicion pos_c en r_old, calculada antes del
-                # bloque SWAP) hacia r_new, en la orientacion que gano.
-                _, r_new, pos, seg_len, reversed_ = best_move
-                d_new = routes[r_new]["depot"]
-                segment = routes[r_old]["custs"][pos_c:pos_c + seg_len]
-                del routes[r_old]["custs"][pos_c:pos_c + seg_len]
-                seg_dem = sum(inst.demands[cc] for cc in segment)
-                route_load[r_old] -= seg_dem
-                depot_load[d_old] -= seg_dem
-                if reversed_:
-                    segment = segment[::-1]
-                for offset, cc in enumerate(segment):
-                    routes[r_new]["custs"].insert(pos + offset, cc)
-                    route_of[cc] = r_new
-                route_load[r_new] += seg_dem
-                depot_load[d_new] = depot_load.get(d_new, 0) + seg_dem
         return improved_any
 
     def close_depot_pass() -> bool:
@@ -842,23 +753,22 @@ def local_search(inst, routes_by_depot, neighbor_lists, time_limit: float = 30.0
         depot_load.clear()
         depot_load.update(snap_depot_load)
 
-    def destroy(strategy: str) -> list[int]:
+    def destroy() -> list[int]:
         """Saca de sus rutas a un grupo de clientes (10-20% del total, elegido
         al azar cada vez) para que converge_local() los tenga que reubicar
-        de cero despues. `strategy` es una de tres formas de elegirlos (el
-        llamador decide cual, con pesos adaptativos -- ver el bucle
-        principal al final de la funcion):
+        de cero despues. Sortea entre tres formas de elegirlos, para que la
+        perturbacion no sea siempre igual:
           - "random": un subconjunto al azar de toda la instancia.
           - "related": un cliente al azar mas sus vecinos geograficos
             cercanos (via neighbor_lists) -- perturba una zona concentrada.
           - "route": rutas completas al azar, hasta juntar la cantidad
             buscada -- fuerza a re-decidir la estructura de esas rutas enteras.
-        No decide donde van a terminar -- eso lo hace repair()/regret_repair()
-        despues.
+        No decide donde van a terminar -- eso lo hace repair() despues.
         """
         all_customers = list(route_of.keys())
         n_total = len(all_customers)
         target = max(1, min(n_total, int(n_total * random.uniform(0.08, 0.20))))
+        strategy = random.choice(("random", "related", "route"))
 
         if strategy == "random":
             removed = random.sample(all_customers, target)
@@ -966,86 +876,21 @@ def local_search(inst, routes_by_depot, neighbor_lists, time_limit: float = 30.0
     # escapar de optimos locales a los que relocate/swap/close solos no
     # pueden salir (ninguna de esas jugadas, por si sola, empeora el costo
     # nunca, asi que sin la perturbacion de LNS quedarian encerradas ahi).
-    #
-    # (Se probo una variante con aceptacion tipo simulated annealing --
-    # dejar que "working" se quedara en perturbaciones que empeoraban un
-    # poco, con probabilidad decreciente en el tiempo, en vez de siempre
-    # revertir a la mejor conocida. En la practica salio PEOR en instancias
-    # medianas/grandes: gasta tiempo del presupuesto vagando por estados
-    # peores sin alcanzar a reconverger, y en clrp-small-01 dio resultados
-    # bastante mas caros que esta version estrictamente golosa con el mismo
-    # tiempo. Se revirtio. clrp-small-08 en particular llego EXACTAMENTE al
-    # mismo costo (8780.77) con ambas variantes en decenas de semillas
-    # distintas -- eso ya no parece un optimo local del que haya que escapar,
-    # sino que 8780.77 es probablemente el optimo real o esta muy cerca de
-    # el para esta instancia en particular.)
-    #
-    # Lo que SI es nuevo aca (nunca probado antes, a diferencia del intento
-    # de simulated annealing de arriba): los tres destroy() se eligen con
-    # pesos ADAPTATIVOS en vez de al azar parejo -- cada SEGMENT iteraciones
-    # se mira que tan seguido encontro cada uno un nuevo mejor global y se
-    # ajustan las probabilidades de volver a elegirlo (ALNS clasico de Ropke
-    # & Pisinger). El criterio de aceptacion sigue siendo el mismo golosos-
-    # siempre-al-mejor de antes -- eso ya se sabe que funciona bien, lo
-    # unico que cambia es CUAL destroy() se prueba mas seguido. (Tambien se
-    # probo un repair() alternativo por "regret" en vez del greedy de
-    # siempre -- descartado: sale ~2x mas caro por llamada que repair(), y
-    # eso le come tantas iteraciones de LNS al presupuesto de tiempo que da
-    # peor resultado que repair() solo, el mismo problema de fondo que el
-    # or-opt que tambien se descarto en su momento.)
     start = time.time()
     converge_local()
 
     best_cost = current_cost()
     best_snapshot = snapshot()
-
-    destroy_ops = ("random", "related", "route")
-    destroy_weight = {op: 1.0 for op in destroy_ops}
-    destroy_score = {op: 0.0 for op in destroy_ops}
-    destroy_uses = {op: 0 for op in destroy_ops}
-    SEGMENT = 20      # cada cuantas iteraciones se recalculan los pesos
-    REACTION = 0.3    # cuanto pesa el desempeno del segmento vs el historico
-    SCORE_NEW_BEST = 3.0
-    MIN_WEIGHT = 0.05  # piso para que ningun operador quede descartado para siempre
-
-    def weighted_pick(weights: dict[str, float]) -> str:
-        total = sum(weights.values())
-        r = random.uniform(0, total)
-        upto = 0.0
-        for op, w in weights.items():
-            upto += w
-            if upto >= r:
-                return op
-        return next(iter(weights))
-
-    iteration = 0
     while time.time() - start < time_limit:
-        iteration += 1
-        d_op = weighted_pick(destroy_weight)
-
-        removed = destroy(d_op)
+        removed = destroy()
         repair(removed)
         converge_local()
         cost = current_cost()
-
         if cost < best_cost - 1e-6:
-            score = SCORE_NEW_BEST
             best_cost = cost
             best_snapshot = snapshot()
         else:
-            score = 0.0
             restore(best_snapshot)  # la perturbacion no ayudo -- se vuelve al mejor conocido
-
-        destroy_score[d_op] += score
-        destroy_uses[d_op] += 1
-
-        if iteration % SEGMENT == 0:
-            for op in destroy_ops:
-                if destroy_uses[op] > 0:
-                    avg = destroy_score[op] / destroy_uses[op]
-                    destroy_weight[op] = max(MIN_WEIGHT, destroy_weight[op] * (1 - REACTION) + REACTION * avg)
-                destroy_score[op] = 0.0
-                destroy_uses[op] = 0
     restore(best_snapshot)
 
     # Se arma el resultado final descartando rutas vacias (depositos
@@ -1069,7 +914,6 @@ def build_solution(inst, seed: int = 0, time_limit: float = 20.0, improve: bool 
     """Orquesta el pipeline completo: construccion golosa (facility location
     + reparacion de bin packing + rutas) y despues, si hay tiempo, la mejora
     con local_search (relocate/swap/cierre de deposito)."""
-    ensure_distance_cache(inst)
     random.seed(seed)
     assignment = solve_facility_location(inst)
     assignment = _repair_bin_packing(inst, assignment)
@@ -1201,13 +1045,11 @@ def main():
     ap.add_argument("--verify", action="store_true")
     ap.add_argument("--time-limit", type=float, default=20.0,
                      help="seconds of local-search improvement after construction (default 20, 0 to disable)")
-    ap.add_argument("--seed", type=int, default=0,
-                     help="random seed for the LNS phase (default 0; vary this to run a multi-seed tournament)")
     args = ap.parse_args()
 
     t0 = time.time()
     inst = parse_instance(args.instance)
-    routes_by_depot = build_solution(inst, seed=args.seed, time_limit=args.time_limit, improve=args.time_limit > 0)
+    routes_by_depot = build_solution(inst, time_limit=args.time_limit, improve=args.time_limit > 0)
     cost = write_solution(inst, routes_by_depot, args.output)
     elapsed = time.time() - t0
     print(f"{inst.name}: cost={cost:.2f} depots={sum(1 for r in routes_by_depot.values() if r)} "
