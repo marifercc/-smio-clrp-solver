@@ -59,6 +59,8 @@ def main():
     total_demand = sum(inst.demands)
     args.sol_dir.mkdir(parents=True, exist_ok=True)
 
+    tmp_path = args.sol_dir / f"_tmp_candidate_{args.instance.stem}.sol.txt"
+
     for i, (accion, combo, moved) in enumerate(neighbors):
         total_cap = sum(min(inst.depot_capacities[d], inst.depot_max_vehicles[d] * inst.vehicle_capacity)
                          for d in combo)
@@ -72,11 +74,30 @@ def main():
                   f"(tiempo {time.time() - t0:.0f}s)")
             continue
         cost = compute_total_cost(inst, routes)
-        marker = "  <-- MEJOR HASTA AHORA" if cost < best[0] - 1e-6 else ""
+        elapsed = time.time() - t0
+        if cost >= best[0] - 1e-6:
+            print(f"  {accion} deposito {moved + 1} -> {[d + 1 for d in combo]}: costo={cost:.2f} "
+                  f"(tiempo {elapsed:.0f}s)")
+            continue
+
+        # PyVRP solo respeta SU propio modelo (capacidad por vehiculo); antes
+        # de aceptar este candidato como mejora, confirmar con el
+        # verificador OFICIAL -- si el resta marca infactible (por ejemplo
+        # por la capacidad agregada de deposito W_i), se descarta.
+        write_solution(inst, routes, tmp_path)
+        check = verify_solution(inst, tmp_path)
+        if not check.feasible:
+            print(f"  {accion} deposito {moved + 1} -> {[d + 1 for d in combo]}: costo={cost:.2f} pero el "
+                  f"verificador OFICIAL lo marca INFACTIBLE -- se descarta (tiempo {elapsed:.0f}s)")
+            for e in check.errors:
+                print("    ERROR:", e)
+            continue
+
         print(f"  {accion} deposito {moved + 1} -> {[d + 1 for d in combo]}: costo={cost:.2f} "
-              f"(tiempo {time.time() - t0:.0f}s){marker}")
-        if cost < best[0] - 1e-6:
-            best = (cost, combo, routes)
+              f"(tiempo {elapsed:.0f}s)  <-- MEJOR HASTA AHORA")
+        best = (cost, combo, routes)
+
+    tmp_path.unlink(missing_ok=True)
 
     cost, combo, routes = best
     out_path = args.sol_dir / f"{args.instance.stem}_neighbors.sol.txt"
@@ -84,6 +105,11 @@ def main():
     result = verify_solution(inst, out_path)
     print(f"\nMEJOR FINAL: depositos {[d + 1 for d in combo]}, costo={cost:.2f}")
     print(f"Guardado en {out_path} -- feasible={result.feasible} recomputed_cost={result.recomputed_cost:.2f}")
+
+    if not result.feasible:
+        # Salvavidas final por si el candidato base (la solucion original)
+        # tampoco resulto factible por alguna razon inesperada.
+        print("ADVERTENCIA: el resultado final NO es factible -- revisar antes de subir.")
 
 
 if __name__ == "__main__":
